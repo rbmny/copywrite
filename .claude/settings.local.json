@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python)",
+      "Bash(git add:*)",
+      "Bash(git commit -m ':*)",
+      "Bash(git push:*)",
+      "Bash(taskkill //F //IM sclang.exe)",
+      "Bash(taskkill //F //IM scsynth.exe)",
+      "Bash(\"/c/Program Files/SuperCollider-3.14.1/sclang.exe\" synthdefs/copywrite_lib.scd)",
+      "WebSearch",
+      "Bash(wc -l /c/Users/ricky/Documents/copywrite/copywrite/**/*.py)",
+      "WebFetch(domain:github.com)"
+    ]
+  }
+}

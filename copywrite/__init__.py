@@ -1,3 +1,3 @@
-"""copywrite - Reverse-engineer production styles and generate new tracks via SuperCollider."""
+"""copywrite - Generate music in the style of reference audio using RAVE and MusicGen."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

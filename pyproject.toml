@@ -4,9 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "copywrite"
-version = "0.1.0"
-description = "Reverse-engineer production styles from reference audio and generate new tracks via SuperCollider"
-readme = "README.md"
+version = "0.2.0"
+description = "Generate music in the style of reference audio using RAVE and MusicGen"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 dependencies = [
@@ -19,12 +18,21 @@ dependencies = [
     "librosa>=0.10",
     "soundfile>=0.12",
     "rich>=13.0",
-    "scikit-learn>=1.2",
+    "torch>=2.0",
+    "torchaudio>=2.0",
 ]
 
 [project.optional-dependencies]
-clap = ["laion-clap>=1.1"]
+rave = ["acids-rave"]
+musicgen = [
+    "transformers>=4.30",
+    "peft>=0.5",
+    "accelerate>=0.20",
+    "datasets",
+    "audiocraft",
+]
 dev = ["pytest>=7.0", "pytest-cov"]
+all = ["copywrite[rave,musicgen,dev]"]
 
 [project.scripts]
 copywrite = "copywrite.cli:cli"

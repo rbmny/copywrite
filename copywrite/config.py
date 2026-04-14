@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import platform
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -12,100 +10,96 @@ from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
-def _default_sc_path() -> str:
-    """Best-guess path to scsynth/sclang based on OS."""
-    system = platform.system()
-    if system == "Windows":
-        candidates = [
-            Path(r"C:\Program Files\SuperCollider\scsynth.exe"),
-            Path(r"C:\Program Files (x86)\SuperCollider\scsynth.exe"),
-        ]
-        for c in candidates:
-            if c.exists():
-                return str(c.parent)
-        found = shutil.which("scsynth") or shutil.which("scsynth.exe")
-        if found:
-            return str(Path(found).parent)
-    elif system == "Darwin":
-        app_path = Path("/Applications/SuperCollider.app/Contents/Resources")
-        if app_path.exists():
-            return str(app_path)
-    else:
-        found = shutil.which("scsynth")
-        if found:
-            return str(Path(found).parent)
-    return ""
-
-
 class CopywriteConfig(BaseSettings):
     """Global configuration loaded from ~/.copywrite/config.yaml."""
 
     # Paths
     project_dir: Path = Field(default_factory=lambda: Path.cwd())
     data_dir: Path = Field(default_factory=lambda: Path.cwd() / "data")
-    supercollider_path: str = Field(default_factory=_default_sc_path)
 
-    # SuperCollider
-    sc_sample_rate: int = 44100
-    sc_block_size: int = 64
-    sc_memory: int = 65536  # server memory in KB
+    # Data Preparation
+    rave_sample_rate: int = 48000
+    musicgen_sample_rate: int = 32000
+    rave_segment_duration: float = 4.0
+    musicgen_segment_duration: float = 20.0
 
-    # Transcription
-    transcribe_max_iterations: int = 15
-    transcribe_score_threshold: float = 0.75
+    # RAVE
+    rave_config: str = "v2"
+    rave_batch_size: int = 8
+    rave_checkpoint_dir: Path = Field(
+        default_factory=lambda: Path.cwd() / "data" / "checkpoints" / "rave"
+    )
+    rave_model_path: Optional[Path] = None
+
+    # MusicGen
+    musicgen_base_model: str = "facebook/musicgen-medium"
+    musicgen_lora_rank: int = 16
+    musicgen_lora_alpha: int = 32
+    musicgen_lora_target_modules: list[str] = Field(
+        default_factory=lambda: ["q_proj", "v_proj"]
+    )
+    musicgen_learning_rate: float = 1e-4
+    musicgen_train_steps: int = 1000
+    musicgen_checkpoint_dir: Path = Field(
+        default_factory=lambda: Path.cwd() / "data" / "checkpoints" / "musicgen"
+    )
+    musicgen_adapter_path: Optional[Path] = None
+
+    # EC2
+    ec2_instance_type: str = "g5.xlarge"
+    ec2_ami_id: str = ""
+    ec2_key_name: str = ""
+    ec2_key_path: str = ""  # path to .pem file for SSH
+    ec2_region: str = "us-east-1"
+    ec2_security_group: str = ""
 
     # Generation
-    default_duration: int = 90  # seconds
-    default_bpm: int = 120
-    default_count: int = 3
-
-    # Scoring
-    scoring_weights: dict = Field(default_factory=lambda: {
-        "rhythm": 0.25,
-        "harmony": 0.20,
-        "spectral": 0.25,
-        "structure": 0.15,
-        "dynamics": 0.15,
-    })
+    generation_duration: float = 15.0
 
     model_config = {"env_prefix": "COPYWRITE_"}
+
+    # --- Directory properties ---
 
     @property
     def reference_dir(self) -> Path:
         return self.data_dir / "reference"
 
     @property
-    def transcriptions_dir(self) -> Path:
-        return self.data_dir / "transcriptions"
+    def rave_preprocessed_dir(self) -> Path:
+        return self.data_dir / "preprocessed" / "rave"
 
     @property
-    def style_model_dir(self) -> Path:
-        return self.data_dir / "style_model"
+    def musicgen_preprocessed_dir(self) -> Path:
+        return self.data_dir / "preprocessed" / "musicgen"
+
+    @property
+    def captions_dir(self) -> Path:
+        return self.data_dir / "captions"
+
+    @property
+    def checkpoints_dir(self) -> Path:
+        return self.data_dir / "checkpoints"
 
     @property
     def generated_dir(self) -> Path:
         return self.data_dir / "generated"
 
     @property
-    def synthdef_dir(self) -> Path:
-        return self.project_dir / "synthdefs"
-
-    @property
-    def sclang_path(self) -> Path:
-        base = Path(self.supercollider_path)
-        name = "sclang.exe" if platform.system() == "Windows" else "sclang"
-        return base / name
-
-    @property
-    def scsynth_path(self) -> Path:
-        base = Path(self.supercollider_path)
-        name = "scsynth.exe" if platform.system() == "Windows" else "scsynth"
-        return base / name
+    def musicgen_dataset_dir(self) -> Path:
+        return self.data_dir / "musicgen_dataset"
 
     def ensure_dirs(self) -> None:
         """Create all data directories if they don't exist."""
-        for d in [self.reference_dir, self.transcriptions_dir,
-                  self.style_model_dir, self.generated_dir]:
+        for d in [
+            self.reference_dir,
+            self.rave_preprocessed_dir,
+            self.musicgen_preprocessed_dir,
+            self.captions_dir,
+            self.rave_checkpoint_dir,
+            self.musicgen_checkpoint_dir,
+            self.generated_dir,
+            self.musicgen_dataset_dir,
+        ]:
             d.mkdir(parents=True, exist_ok=True)
 
     def save(self, path: Optional[Path] = None) -> None:
@@ -113,7 +107,6 @@ class CopywriteConfig(BaseSettings):
         path = path or _config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         data = self.model_dump(mode="json")
-        # Convert Path objects to strings for YAML
         for k, v in data.items():
             if isinstance(v, Path):
                 data[k] = str(v)
@@ -130,6 +123,9 @@ def load_config() -> CopywriteConfig:
     path = _config_path()
     if path.exists():
         with open(path) as f:
-            data = yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        # Drop any keys from old SC-based config that no longer exist
+        valid_fields = set(CopywriteConfig.model_fields.keys())
+        data = {k: v for k, v in raw.items() if k in valid_fields}
         return CopywriteConfig(**data)
     return CopywriteConfig()
