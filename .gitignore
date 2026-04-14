@@ -9,3 +9,5 @@ build/
 .env
 *.tmp
 data/*.scd
+data/musicgen_dataset.tar.gz
+data/*.tar.gz
