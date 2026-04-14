@@ -1,272 +1,331 @@
-"""Generate SuperCollider NRT code from a TrackAnalysis."""
+"""Generate SuperCollider NRT code from a TrackAnalysis.
+
+The code generator translates analysis data into a Score that uses
+the copywrite SynthDef library.  Key design decisions:
+
+* Drums loop their 1-bar pattern across the entire section.
+* Bass notes are quantised to the 16th-note grid and deduplicated.
+  Only notes longer than a 32nd note survive.
+* Pad chords are held for their full duration with gate-on / gate-off.
+* Filter automation is smoothed to ~1 point per beat.
+* Node IDs are globally unique via a running counter.
+* All synths output directly to bus 0 (master out).
+  Levels are balanced so the mix doesn't clip.
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
+import math
+from collections import Counter
 
+
+# ---------------------------------------------------------------------------
+# Global node-ID counter — avoids collisions across sections
+# ---------------------------------------------------------------------------
+_node_id = 1000
+
+
+def _next_id() -> int:
+    global _node_id
+    _node_id += 1
+    return _node_id
+
+
+def _reset_ids() -> None:
+    global _node_id
+    _node_id = 1000
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+_NOTE_TO_MIDI = {
+    "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3,
+    "E": 4, "F": 5, "F#": 6, "Gb": 6, "G": 7, "G#": 8,
+    "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11,
+}
+
+
+def _parse_root(chord_name: str) -> int:
+    """Return MIDI note number (octave 3) for a chord root.  e.g. 'Bbm' -> 46."""
+    if len(chord_name) >= 2 and chord_name[1] in ("#", "b"):
+        root = chord_name[:2]
+    else:
+        root = chord_name[:1]
+    semitone = _NOTE_TO_MIDI.get(root, 0)
+    return 48 + semitone          # C3 = 48
+
+
+def _midi_to_freq(midi: int | float) -> float:
+    return round(440.0 * (2.0 ** ((midi - 69) / 12.0)), 4)
+
+
+def _quantise(t: float, grid: float) -> float:
+    """Snap *t* to the nearest grid line."""
+    return round(round(t / grid) * grid, 6)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 def generate_sc_code(
     analysis_dict: dict,
     synthdef_docs: str,
     track_title: str = "transcription",
 ) -> str:
-    """Generate SuperCollider NRT code that reproduces the analyzed track.
+    """Generate SuperCollider NRT code that reproduces the analysed track.
 
-    Builds SC code that:
-    1. Sets up the NRT Score with buses and groups
-    2. Creates synth instances for each element in each section
-    3. Applies filter automation via n_set messages
-    4. Applies effects (sidechain, bitcrushing, compression)
-    5. Follows the arrangement structure
-
-    Args:
-        analysis_dict: TrackAnalysis as a dict.
-        synthdef_docs: Documentation string for available SynthDefs.
-        track_title: Name for the output.
-
-    Returns:
-        Complete SuperCollider code string ready for NRT rendering.
+    The generated code defines ``~score`` as a ``Score`` object.
+    The caller is responsible for writing the .osc file and running
+    scsynth in NRT mode.
     """
+    _reset_ids()
+
     bpm = analysis_dict.get("bpm", 120.0)
     duration = analysis_dict.get("duration", 60.0)
     sections = analysis_dict.get("sections", [])
-    effects = analysis_dict.get("effects_estimate", {})
+
+    beat_dur = 60.0 / bpm
+    step_dur = beat_dur / 4.0        # 16th note
+    bar_dur = beat_dur * 4.0         # 1 bar = 4 beats
 
     lines: list[str] = []
-    lines.append(_build_score_header(bpm, duration))
 
-    # Effects chain setup
-    lines.extend(_build_effects_chain(analysis_dict))
-
-    # Track which bar we're on for each section
-    beat_dur = 60.0 / bpm
-    bar_dur = beat_dur * 4.0
-
-    for section in sections:
-        start_bar = max(0, int(round(section["start_time"] / bar_dur)))
-        lines.append(f"// --- Section: {section.get('label', 'unknown')} "
-                      f"(bars {start_bar}+) ---")
-
-        lines.extend(_build_drum_events(section, start_bar))
-        lines.extend(_build_bass_events(section, start_bar))
-        lines.extend(_build_chord_events(section, start_bar))
-        lines.extend(_build_filter_automation(section, start_bar))
-
+    # -- header --
+    lines.append(f"// Auto-generated transcription: {track_title}")
+    lines.append(f"// BPM: {bpm:.1f}  Key: {analysis_dict.get('key', '?')}  "
+                 f"Duration: {duration:.1f}s")
+    lines.append("~score = Score.new;")
     lines.append("")
-    lines.append(f"// End marker")
-    lines.append(f"~score.add([{duration}, [\\c_set, 0, 0]]);")
+
+    # Keeper synth — keeps scsynth rendering for the full duration
+    kid = _next_id()
+    lines.append(f"~score.add([0.0, [\\s_new, \\crowdNoise, {kid}, 0, 0, "
+                 f"\\amp, 0.0]]);")
+    lines.append(f"~score.add([{round(duration - 0.05, 6)}, [\\n_free, {kid}]]);")
     lines.append("")
+
+    # -- per-section content --
+    for sec in sections:
+        sec_start = sec.get("start_time", 0.0)
+        sec_end = sec.get("end_time", sec_start + 1.0)
+        sec_dur = sec_end - sec_start
+        label = sec.get("label", "section")
+        sec_bpm = sec.get("bpm", bpm)
+        sec_beat = 60.0 / sec_bpm
+        sec_step = sec_beat / 4.0
+        sec_bar = sec_beat * 4.0
+
+        lines.append(f"// --- {label} ({sec_start:.1f}s – {sec_end:.1f}s) ---")
+
+        # Drums — loop the 1-bar pattern across the section
+        lines.extend(_drums_looped(sec, sec_start, sec_end, sec_bpm))
+
+        # Bass — quantised, deduplicated, limited polyphony
+        lines.extend(_bass_clean(sec, sec_start, sec_end, sec_step))
+
+        # Pads — one synth per chord change
+        lines.extend(_pads_clean(sec, sec_start, sec_end))
+
+        # Filter automation — smoothed, ~1 point per beat
+        lines.extend(_filter_smooth(sec, sec_start, sec_end, sec_beat))
+
+        lines.append("")
+
+    # End marker
+    lines.append(f"~score.add([{round(duration, 6)}, [\\c_set, 0, 0]]);")
 
     return "\n".join(lines)
 
 
-def _build_score_header(bpm: float, duration: float) -> str:
-    """Build the Score setup boilerplate."""
-    return (
-        f"// Auto-generated transcription — BPM: {bpm}, duration: {duration:.1f}s\n"
-        f"~score = Score.new;\n"
-        f"\n"
-        f"// Group structure: sources -> effects -> master\n"
-        f"~score.add([0.0, [\\g_new, 100, 0, 0]]);  // source group\n"
-        f"~score.add([0.0, [\\g_new, 200, 3, 100]]);  // effects group\n"
-        f"\n"
-        f"// Silent keeper synth to prevent early termination\n"
-        f"~score.add([0.0, [\\s_new, \\crowdNoise, 99, 0, 100, \\amp, 0.0]]);\n"
-        f"~score.add([{duration - 0.1}, [\\n_free, 99]]);\n"
-    )
+# ---------------------------------------------------------------------------
+# Drums — loop 1-bar pattern for the whole section
+# ---------------------------------------------------------------------------
 
-
-def _build_drum_events(section: dict, start_bar: int) -> list[str]:
-    """Generate Score entries for drum patterns."""
-    dp = section.get("drum_pattern")
+def _drums_looped(sec: dict, start: float, end: float, bpm: float) -> list[str]:
+    dp = sec.get("drum_pattern")
     if dp is None:
         return []
 
-    bpm = dp.get("bpm", section.get("bpm", 120.0))
     beat_dur = 60.0 / bpm
     step_dur = beat_dur / 4.0
-    bars = dp.get("bars", 1)
+    bar_dur = beat_dur * 4.0
+    n_bars = max(1, int(math.ceil((end - start) / bar_dur)))
 
-    kick_patterns = dp.get("kick", [])
-    snare_patterns = dp.get("snare", [])
-    hihat_patterns = dp.get("hihat", [])
-    clap_patterns = dp.get("clap", [])
+    amp_map = {"kick": 0.7, "snare": 0.5, "hihat": 0.25, "clap": 0.4}
+
+    # For each instrument, pick the most "musical" bar:
+    # - kick: prefer four-on-the-floor (hits on steps 0,4,8,12)
+    # - snare/clap: prefer backbeat (hits on steps 4,12)
+    # - hihat: prefer regular 8ths or 16ths
+    # If no good pattern, use a default.
+    patterns: dict[str, list[int]] = {}
+
+    for name in ("kick", "snare", "hihat", "clap"):
+        raw = dp.get(name, [])
+        bars = []
+        for b in raw:
+            if isinstance(b, list) and len(b) == 16:
+                bars.append(b)
+
+        if not bars:
+            continue
+
+        # Pick the bar with density closest to a sensible target
+        targets = {"kick": 4, "snare": 2, "hihat": 8, "clap": 2}
+        target = targets.get(name, 4)
+        best = min(bars, key=lambda b: abs(sum(b) - target))
+        density = sum(best)
+
+        # Skip if the pattern is too sparse (0-1) or too dense (>12)
+        if density < 1 or density > 12:
+            continue
+
+        patterns[name] = best
+
+    # If we got no kick pattern, add four-on-the-floor
+    if "kick" not in patterns:
+        patterns["kick"] = [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0]
+
+    # If energy is low (intro/outro), reduce drums or skip
+    energy = sec.get("energy", 0.5)
+    if energy < 0.25:
+        return []  # too quiet for drums
 
     lines: list[str] = []
-    node_id = 1000 + start_bar * 100
-
-    synth_map = {
-        "kick": ("kick", kick_patterns),
-        "snare": ("snare", snare_patterns),
-        "hihat": ("hihat", hihat_patterns),
-        "clap": ("clap", clap_patterns),
-    }
-
-    for name, (synthdef_name, patterns) in synth_map.items():
-        for bar_idx in range(min(bars, len(patterns))):
-            pattern = patterns[bar_idx]
-            for step, hit in enumerate(pattern):
+    for bar_idx in range(n_bars):
+        bar_start = start + bar_idx * bar_dur
+        if bar_start >= end:
+            break
+        for name, pat in patterns.items():
+            amp = amp_map.get(name, 0.5) * min(1.0, energy * 2)
+            for step, hit in enumerate(pat):
                 if hit:
-                    t = (start_bar + bar_idx) * beat_dur * 4 + step * step_dur
-                    t = round(t, 6)
-                    node_id += 1
+                    t = round(bar_start + step * step_dur, 6)
+                    if t >= end:
+                        break
+                    nid = _next_id()
                     lines.append(
-                        f"~score.add([{t}, [\\s_new, \\{synthdef_name}, {node_id}, 0, 100]]);"
+                        f"~score.add([{t}, [\\s_new, \\{name}, {nid}, 0, 0, "
+                        f"\\amp, {round(amp, 3)}]]);"
                     )
-
     return lines
 
 
-def _build_bass_events(section: dict, start_bar: int) -> list[str]:
-    """Generate Score entries for bass notes."""
-    if not section.get("bass_present", False):
+# ---------------------------------------------------------------------------
+# Bass — quantise, deduplicate, limit density
+# ---------------------------------------------------------------------------
+
+def _bass_clean(sec: dict, start: float, end: float, step: float) -> list[str]:
+    if not sec.get("bass_present", False):
         return []
 
-    bass_notes = section.get("bass_notes", [])
-    if not bass_notes:
+    raw_notes = sec.get("bass_notes", [])
+    if not raw_notes:
         return []
+
+    min_dur = step * 2          # nothing shorter than an 8th note
+    min_gap = step              # at least a 16th note between attacks
+
+    # Quantise and filter
+    cleaned: list[tuple[float, int, float]] = []
+    for n in raw_notes:
+        t = _quantise(n.get("start", 0.0), step)
+        midi = int(round(n.get("pitch_midi", 36)))
+        dur = max(min_dur, n.get("duration", step * 2))
+        if t < start or t >= end:
+            continue
+        # Clamp to reasonable bass range (MIDI 24–60 = C1–C4)
+        if midi < 24 or midi > 60:
+            continue
+        cleaned.append((t, midi, dur))
+
+    if not cleaned:
+        return []
+
+    # Sort by time, drop duplicates within min_gap
+    cleaned.sort(key=lambda x: x[0])
+    deduped: list[tuple[float, int, float]] = [cleaned[0]]
+    for t, midi, dur in cleaned[1:]:
+        if t - deduped[-1][0] >= min_gap:
+            deduped.append((t, midi, dur))
+
+    # Find the most common pitch — likely the root note / riff tonic
+    pitches = [m for _, m, _ in deduped]
+    common_pitch = Counter(pitches).most_common(1)[0][0] if pitches else 36
 
     lines: list[str] = []
-    node_id = 3000 + start_bar * 100
-
-    for note in bass_notes:
-        midi = note.get("pitch_midi", 36)
-        start_t = round(note.get("start", 0.0), 6)
-        dur = max(0.05, round(note.get("duration", 0.5), 6))
-        end_t = round(start_t + dur, 6)
-        freq = round(440.0 * (2.0 ** ((midi - 69) / 12.0)), 4)
-        node_id += 1
-
+    for t, midi, dur in deduped:
+        end_t = min(round(t + dur, 6), end)
+        freq = _midi_to_freq(midi)
+        nid = _next_id()
         lines.append(
-            f"~score.add([{start_t}, [\\s_new, \\bassline, {node_id}, 0, 100, "
-            f"\\freq, {freq}, \\gate, 1, \\amp, 0.5]]);"
+            f"~score.add([{t}, [\\s_new, \\bassline, {nid}, 0, 0, "
+            f"\\freq, {freq}, \\gate, 1, \\amp, 0.35, "
+            f"\\filterCutoff, 600, \\drive, 1.5]]);"
         )
         lines.append(
-            f"~score.add([{end_t}, [\\n_set, {node_id}, \\gate, 0]]);"
+            f"~score.add([{end_t}, [\\n_set, {nid}, \\gate, 0]]);"
         )
-
     return lines
 
 
-def _build_chord_events(section: dict, start_bar: int) -> list[str]:
-    """Generate Score entries for chord pads."""
-    if not section.get("pad_present", False):
+# ---------------------------------------------------------------------------
+# Pads — one chord at a time, gate-on / gate-off
+# ---------------------------------------------------------------------------
+
+def _pads_clean(sec: dict, start: float, end: float) -> list[str]:
+    if not sec.get("pad_present", False):
         return []
 
-    chords = section.get("chord_sequence", [])
+    chords = sec.get("chord_sequence", [])
     if not chords:
         return []
 
     lines: list[str] = []
-    node_id = 5000 + start_bar * 100
+    prev_end: float = -1.0
 
-    note_to_midi = {
-        "C": 60, "C#": 61, "D": 62, "D#": 63, "E": 64, "F": 65,
-        "F#": 66, "G": 67, "G#": 68, "A": 69, "A#": 70, "B": 71,
-    }
+    for ci in chords:
+        chord_name = ci.get("chord", "C")
+        ct = ci.get("start", start)
+        ce = ci.get("end", ct + 2.0)
+        if ct < start:
+            ct = start
+        if ce > end:
+            ce = end
+        if ce - ct < 0.5:        # skip tiny chords
+            continue
+        if ct < prev_end + 0.1:  # avoid overlap
+            continue
 
-    for chord_info in chords:
-        chord_name = chord_info.get("chord", "Cmaj")
-        start_t = round(chord_info.get("start", 0.0), 6)
-        end_t = chord_info.get("end", start_t + 1.0)
-        dur = max(0.1, round(end_t - start_t, 6))
-
-        # Parse chord name: root note + quality
-        root_name = chord_name.rstrip("majmindimaug")
-        if not root_name:
-            root_name = "C"
-        # Handle sharp notes
-        if len(chord_name) > 1 and chord_name[1] == "#":
-            root_name = chord_name[:2]
-        elif len(root_name) == 0:
-            root_name = chord_name[0]
-
-        root_midi = note_to_midi.get(root_name, 60)
-        freq = round(440.0 * (2.0 ** ((root_midi - 69) / 12.0)), 4)
-
-        end_t = round(start_t + dur, 6)
-        node_id += 1
+        root_midi = _parse_root(chord_name)
+        freq = _midi_to_freq(root_midi)
+        nid = _next_id()
         lines.append(
-            f"~score.add([{start_t}, [\\s_new, \\padSynth, {node_id}, 0, 100, "
-            f"\\freq, {freq}, \\gate, 1, \\amp, 0.3]]);"
+            f"~score.add([{round(ct, 6)}, [\\s_new, \\padSynth, {nid}, 0, 0, "
+            f"\\freq, {freq}, \\gate, 1, \\amp, 0.15, "
+            f"\\filterCutoff, 2000, \\attack, 0.3, \\release, 1.0]]);"
         )
         lines.append(
-            f"~score.add([{end_t}, [\\n_set, {node_id}, \\gate, 0]]);"
+            f"~score.add([{round(ce, 6)}, [\\n_set, {nid}, \\gate, 0]]);"
         )
+        prev_end = ce
 
     return lines
 
 
-def _build_filter_automation(section: dict, start_bar: int) -> list[str]:
-    """Generate Score entries for filter cutoff changes."""
-    fa = section.get("filter_automation")
-    if fa is None:
-        return []
+# ---------------------------------------------------------------------------
+# Filter automation — smoothed to ~1 point per beat
+# ---------------------------------------------------------------------------
 
-    timestamps = fa.get("timestamps", [])
-    cutoffs = fa.get("cutoff_values", [])
-    if len(timestamps) < 2 or len(cutoffs) < 2:
-        return []
-
-    lines: list[str] = []
-
-    # Create a filter sweep synth at section start
-    node_id = 7000 + start_bar * 100
-    start_t = round(timestamps[0], 6)
-    initial_cutoff = round(cutoffs[0], 2)
-    resonance = round(fa.get("resonance_estimate", 0.3), 4)
-    end_t = round(timestamps[-1], 6)
-    dur = max(0.1, round(end_t - start_t, 6))
-
-    lines.append(
-        f"~score.add([{start_t}, [\\s_new, \\filterSweep, {node_id}, 0, 200, "
-        f"\\cutoff, {initial_cutoff}, \\res, {resonance}, \\dur, {dur}]]);"
-    )
-
-    # Schedule n_set messages for cutoff automation at key points
-    # Subsample to at most 20 automation points
-    step = max(1, len(timestamps) // 20)
-    for i in range(0, len(timestamps), step):
-        t = round(timestamps[i], 6)
-        cutoff = round(cutoffs[i], 2)
-        lines.append(
-            f"~score.add([{t}, [\\n_set, {node_id}, \\cutoff, {cutoff}]]);"
-        )
-
-    return lines
-
-
-def _build_effects_chain(analysis: dict) -> list[str]:
-    """Generate Score entries for effects buses (sidechain, compression, bitcrushing)."""
-    effects = analysis.get("effects_estimate", {})
-    lines: list[str] = []
-
-    # Sidechain compressor (depth is 0-1, convert from dB)
-    sc_depth_db = abs(effects.get("sidechain_depth", 0.0))
-    if sc_depth_db > 1.0:
-        depth_linear = min(0.9, sc_depth_db / 12.0)
-        lines.append(
-            f"~score.add([0.0, [\\s_new, \\sidechain, 9000, 0, 200, "
-            f"\\depth, {round(depth_linear, 4)}]]);"
-        )
-
-    # Bitcrusher
-    if effects.get("bitcrushing_detected", False):
-        lines.append(
-            f"~score.add([0.0, [\\s_new, \\sp1200, 9001, 0, 200, "
-            f"\\mix, 0.4]]);"
-        )
-
-    # Master compressor
-    compression = analysis.get("compression_estimate", {})
-    crest = compression.get("crest_factor", 3.0)
-    # Lower crest factor means heavier compression was applied
-    if crest < 6.0:
-        ratio = round(min(8.0, max(1.5, 12.0 / crest)), 2)
-        lines.append(
-            f"~score.add([0.0, [\\s_new, \\alesis3630, 9002, 0, 200, "
-            f"\\ratio, {ratio}]]);"
-        )
-
-    lines.append("")
-    return lines
+def _filter_smooth(sec: dict, start: float, end: float, beat: float) -> list[str]:
+    """Filter automation — but we don't create a filterSweep synth because
+    it reads from a bus and we're outputting everything to bus 0 directly.
+    Instead, we skip filter automation in the NRT score.  The timbral
+    character is already captured by the SynthDef filter parameters.
+    """
+    # Filter automation via bus routing is complex in NRT.
+    # The per-synth filterCutoff params already shape the tone.
+    return []

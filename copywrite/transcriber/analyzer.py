@@ -328,39 +328,64 @@ def _track_bass_notes(
         return []
 
     times = librosa.times_like(f0, sr=sr)
+
+    # Median-filter the f0 to remove pitch wobble (window = 5 frames)
+    from scipy.ndimage import median_filter
+    f0_clean = f0.copy()
+    valid = voiced & np.isfinite(f0) & (f0 > 0)
+    if np.sum(valid) > 5:
+        midi_raw = np.where(valid, librosa.hz_to_midi(np.where(f0 > 0, f0, 1)), 0)
+        midi_filt = median_filter(midi_raw, size=5)
+        # Round to nearest semitone
+        midi_filt = np.round(midi_filt)
+    else:
+        return []
+
+    # Group consecutive same-pitch frames into notes
+    beat_dur = 60.0 / 120.0  # fallback; real BPM is used in codegen
+    min_note_dur = 0.06  # 60ms minimum note
     notes = []
     current_midi = None
     note_start = 0.0
 
-    for i, (freq, v) in enumerate(zip(f0, voiced)):
+    for i in range(len(midi_filt)):
         t = float(times[i]) + start
-        if v and freq is not None and not np.isnan(freq) and freq > 0:
-            midi = int(round(librosa.hz_to_midi(freq)))
+        midi = int(midi_filt[i])
+        is_voiced = bool(valid[i]) and midi > 0
+
+        if is_voiced:
             if midi != current_midi:
+                # Close previous note
                 if current_midi is not None:
-                    notes.append({
-                        "pitch_midi": current_midi,
-                        "start": note_start,
-                        "duration": t - note_start,
-                    })
+                    dur = t - note_start
+                    if dur >= min_note_dur:
+                        notes.append({
+                            "pitch_midi": current_midi,
+                            "start": round(note_start, 4),
+                            "duration": round(dur, 4),
+                        })
                 current_midi = midi
                 note_start = t
         else:
             if current_midi is not None:
-                notes.append({
-                    "pitch_midi": current_midi,
-                    "start": note_start,
-                    "duration": t - note_start,
-                })
+                dur = t - note_start
+                if dur >= min_note_dur:
+                    notes.append({
+                        "pitch_midi": current_midi,
+                        "start": round(note_start, 4),
+                        "duration": round(dur, 4),
+                    })
                 current_midi = None
 
     # Close any open note
     if current_midi is not None:
-        notes.append({
-            "pitch_midi": current_midi,
-            "start": note_start,
-            "duration": end - note_start,
-        })
+        dur = end - note_start
+        if dur >= min_note_dur:
+            notes.append({
+                "pitch_midi": current_midi,
+                "start": round(note_start, 4),
+                "duration": round(dur, 4),
+            })
 
     return notes
 
