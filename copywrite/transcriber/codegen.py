@@ -154,7 +154,8 @@ def _drums_looped(sec: dict, start: float, end: float, bpm: float) -> list[str]:
     bar_dur = beat_dur * 4.0
     n_bars = max(1, int(math.ceil((end - start) / bar_dur)))
 
-    amp_map = {"kick": 0.7, "snare": 0.5, "hihat": 0.25, "clap": 0.4}
+    # 909 levels — kick is king in Daft Punk mixes
+    amp_map = {"kick": 0.85, "snare": 0.45, "hihat": 0.18, "clap": 0.35}
 
     # For each instrument, pick the most "musical" bar:
     # - kick: prefer four-on-the-floor (hits on steps 0,4,8,12)
@@ -207,9 +208,17 @@ def _drums_looped(sec: dict, start: float, end: float, bpm: float) -> list[str]:
                     if t >= end:
                         break
                     nid = _next_id()
+                    # 909-style params per instrument
+                    extra = ""
+                    if name == "kick":
+                        extra = ", \\decay, 0.6, \\punch, 1.0"
+                    elif name == "snare":
+                        extra = ", \\decay, 0.22"
+                    elif name == "hihat":
+                        extra = ", \\decay, 0.05"
                     lines.append(
                         f"~score.add([{t}, [\\s_new, \\{name}, {nid}, 0, 0, "
-                        f"\\amp, {round(amp, 3)}]]);"
+                        f"\\amp, {round(amp, 3)}{extra}]]);"
                     )
     return lines
 
@@ -261,10 +270,14 @@ def _bass_clean(sec: dict, start: float, end: float, step: float) -> list[str]:
         end_t = min(round(t + dur, 6), end)
         freq = _midi_to_freq(midi)
         nid = _next_id()
+        # TB-303 style: low filter cutoff, high resonance, heavy drive
+        # This is the core Daft Punk "Homework" bass sound
         lines.append(
             f"~score.add([{t}, [\\s_new, \\bassline, {nid}, 0, 0, "
-            f"\\freq, {freq}, \\gate, 1, \\amp, 0.35, "
-            f"\\filterCutoff, 600, \\drive, 1.5]]);"
+            f"\\freq, {freq}, \\gate, 1, \\amp, 0.4, "
+            f"\\filterCutoff, 400, \\filterRes, 0.6, \\filterEnv, 2500, "
+            f"\\accent, 0.7, \\drive, 4.0, "
+            f"\\decay, 0.2, \\sustain, 0.5, \\release, 0.4]]);"
         )
         lines.append(
             f"~score.add([{end_t}, [\\n_set, {nid}, \\gate, 0]]);"
@@ -303,10 +316,12 @@ def _pads_clean(sec: dict, start: float, end: float) -> list[str]:
         root_midi = _parse_root(chord_name)
         freq = _midi_to_freq(root_midi)
         nid = _next_id()
+        # Juno-106 style pad: warm filter, chorus, long release
         lines.append(
             f"~score.add([{round(ct, 6)}, [\\s_new, \\padSynth, {nid}, 0, 0, "
-            f"\\freq, {freq}, \\gate, 1, \\amp, 0.15, "
-            f"\\filterCutoff, 2000, \\attack, 0.3, \\release, 1.0]]);"
+            f"\\freq, {freq}, \\gate, 1, \\amp, 0.12, "
+            f"\\filterCutoff, 1500, \\filterRes, 0.15, "
+            f"\\attack, 0.5, \\decay, 1.0, \\sustain, 0.6, \\release, 2.0]]);"
         )
         lines.append(
             f"~score.add([{round(ce, 6)}, [\\n_set, {nid}, \\gate, 0]]);"
