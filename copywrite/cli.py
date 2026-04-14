@@ -311,6 +311,155 @@ def generate_rave(mode, duration, count, temperature):
         console.print(f"  [green]Saved: {out}[/green]")
 
 
+@generate.command("transform")
+@click.option("--input", "-i", "input_file", required=True,
+              type=click.Path(exists=True), help="Input audio file to transform")
+@click.option("--prompt", "-p", default=None,
+              help="Style prompt (default: Daft Punk style)")
+@click.option("--duration", "-d", type=float, default=None,
+              help="Output duration (default: match input length)")
+@click.option("--output", "-o", "output_file", default=None,
+              help="Output file path")
+@click.option("--ec2", is_flag=True, help="Run on EC2 instead of locally")
+def generate_transform(input_file, prompt, duration, output_file, ec2):
+    """Transform existing music into the trained style (Daft Punk).
+
+    Takes any audio file as input and re-generates it in the Daft Punk
+    style using melody conditioning — the structure/melody of the input
+    is preserved but the timbre, production, and feel are transformed.
+    """
+    from copywrite.config import load_config
+    from copywrite.utils.audio import load_audio, save_audio
+    import numpy as np
+
+    config = load_config()
+    config.ensure_dirs()
+    input_path = Path(input_file)
+
+    default_prompt = (
+        "Daft Punk style french filter house, heavy sidechain compression, "
+        "analog synths, resonant filter sweep, four on the floor kick, "
+        "12-bit grit, repetitive hypnotic groove, electronic"
+    )
+    style_prompt = prompt or default_prompt
+
+    # Load input audio
+    audio_in, sr_in = load_audio(input_path, sr=config.musicgen_sample_rate, mono=True)
+    input_duration = len(audio_in) / sr_in
+    dur = duration or min(input_duration, 30.0)  # MusicGen max ~30s
+
+    out_path = Path(output_file) if output_file else (
+        config.generated_dir / f"{input_path.stem}_daftpunk.wav"
+    )
+
+    console.print(Panel(
+        f'Input: {input_path.name} ({input_duration:.1f}s)\n'
+        f'Style: {style_prompt[:80]}...\n'
+        f'Duration: {dur}s',
+        title="copywrite transform",
+    ))
+
+    if ec2:
+        _transform_on_ec2(config, input_path, style_prompt, dur, out_path)
+    else:
+        from copywrite.musicgen.generate import load_model, generate_with_melody
+        model, processor = load_model(config)
+
+        # For long inputs, process in 30s chunks
+        chunks = []
+        chunk_size = int(30.0 * sr_in)
+        for start in range(0, len(audio_in), chunk_size):
+            chunk = audio_in[start:start + chunk_size]
+            if len(chunk) < sr_in * 2:  # skip chunks < 2s
+                break
+            chunk_dur = min(30.0, len(chunk) / sr_in)
+            result = generate_with_melody(model, processor, style_prompt,
+                                          chunk, duration=chunk_dur,
+                                          sr=config.musicgen_sample_rate)
+            chunks.append(result)
+            console.print(f"  Chunk {len(chunks)} done ({chunk_dur:.1f}s)")
+
+        audio_out = np.concatenate(chunks) if chunks else np.zeros(int(dur * sr_in))
+        save_audio(out_path, audio_out, sr=config.musicgen_sample_rate)
+
+    console.print(f"  [green]Saved: {out_path}[/green]")
+
+
+def _transform_on_ec2(config, input_path, prompt, duration, output_path):
+    """Run the transform on an existing EC2 instance or launch one."""
+    from copywrite.utils.ec2 import (
+        launch_instance, wait_for_instance, upload_files,
+        download_files, run_remote_command, terminate_instance,
+    )
+    import tempfile
+
+    console.print("[cyan]Running transform on EC2...[/cyan]")
+
+    # Check for running instance or launch new one
+    instance = launch_instance(
+        config.ec2_instance_type, config.ec2_ami_id,
+        config.ec2_key_name, config.ec2_security_group, config.ec2_region,
+    )
+    instance = wait_for_instance(instance.instance_id, config.ec2_region)
+    ip = instance.public_ip
+    key = config.ec2_key_path
+
+    try:
+        # Upload input audio
+        upload_files(ip, key, [input_path], "~/")
+
+        # Generate transform script
+        script = f'''
+import torch, numpy as np, soundfile as sf
+from transformers import MusicgenForConditionalGeneration, AutoProcessor
+from peft import PeftModel
+
+model = MusicgenForConditionalGeneration.from_pretrained("facebook/musicgen-medium")
+model = PeftModel.from_pretrained(model, "/home/ubuntu/musicgen_output/final_adapter")
+model = model.merge_and_unload()
+model.to("cuda").eval()
+processor = AutoProcessor.from_pretrained("facebook/musicgen-medium")
+
+audio, sr = sf.read("/home/ubuntu/{input_path.name}")
+if audio.ndim > 1:
+    audio = audio.mean(axis=1)
+import librosa
+audio = librosa.resample(audio, orig_sr=sr, target_sr=32000)
+
+melody = torch.tensor(audio[:int(32000 * {duration})], dtype=torch.float32)
+melody = melody.unsqueeze(0).unsqueeze(0).to("cuda")
+
+inputs = processor(text=["{prompt}"], padding=True, return_tensors="pt").to("cuda")
+
+with torch.no_grad():
+    try:
+        out = model.generate(**inputs, audio=melody, max_new_tokens={int(duration * 50)})
+    except TypeError:
+        out = model.generate(**inputs, max_new_tokens={int(duration * 50)}, do_sample=True, guidance_scale=3.0)
+
+sf.write("/home/ubuntu/transformed.wav", out[0, 0].cpu().numpy(), 32000)
+print("Transform complete!")
+'''
+        script_path = Path(tempfile.mktemp(suffix=".py"))
+        script_path.write_text(script)
+        upload_files(ip, key, [script_path], "~/")
+
+        run_remote_command(ip, key,
+            "pip install -q librosa soundfile && "
+            f"python3 -u ~/{script_path.name}", timeout=600)
+
+        # Download result
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        download_files(ip, key, ["~/transformed.wav"], output_path.parent)
+        import shutil
+        downloaded = output_path.parent / "transformed.wav"
+        if downloaded != output_path:
+            shutil.move(str(downloaded), str(output_path))
+
+    finally:
+        terminate_instance(instance.instance_id, config.ec2_region)
+
+
 @generate.command("combined")
 @click.option("--prompt", "-p", required=True, help="Text description")
 @click.option("--duration", "-d", type=float, default=30.0)
